@@ -1,0 +1,483 @@
+---
+title: "Untitled"
+author: "B12207073"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# 安裝並載入所需套件
+pkgs <- c("tidyverse", "haven", "janitor", "stringr", "scales", "knitr")
+to_install <- setdiff(pkgs, rownames(installed.packages()))
+if (length(to_install) > 0) install.packages(to_install)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+dir.create("outputs", showWarnings = FALSE)
+
+# 讀取 NHANES 2021-2023 資料集
+demo <- read_xpt("DEMO_L.XPT") %>% clean_names()
+bmx  <- read_xpt("BMX_L.XPT")  %>% clean_names()
+bpx  <- read_xpt("BPXO_L.XPT") %>% clean_names()
+
+# 確認受試者 ID (seqn) 無重複
+stopifnot(!anyDuplicated(demo$seqn))
+stopifnot(!anyDuplicated(bmx$seqn))
+stopifnot(!anyDuplicated(bpx$seqn))
+
+# 篩選 >= 20 歲之成年人並將性別轉為 Factor
+demo_adult <- demo %>%
+  transmute(
+    seqn,
+    age = ridageyr,
+    sex = factor(riagendr, levels = c(1, 2), labels = c("Male", "Female"))
+  ) %>%
+  filter(age >= 20)
+```
+
+# Data Cleaning
+
+## 
+
+```{r}
+clean_outlier_var <- function(x, lo_bound, hi_bound) {
+  range_flag <- x < lo_bound | x > hi_bound
+  q <- quantile(x, probs = c(0.25, 0.75), na.rm = TRUE, names = FALSE)
+  iqr <- q[2] - q[1]
+  iqr_flag <- x < (q[1] - 1.5 * iqr) | x > (q[2] + 1.5 * iqr)
+  
+  # (3) MAD-based robust z-score rule
+  med <- median(x, na.rm = TRUE)
+  mad_raw <- mad(x, center = med, constant = 1, na.rm = TRUE)
+  if (is.na(mad_raw) || mad_raw == 0) {
+    mad_flag <- rep(FALSE, length(x))
+  } else {
+    robust_z <- abs(x - med) / (1.4826 * mad_raw)
+    mad_flag <- robust_z > 3.5
+  }
+  
+  flag <- !is.na(x) & (range_flag | iqr_flag | mad_flag)
+  ifelse(flag, NA_real_, x)
+}
+
+
+bmi_clean_df <- bmx %>%
+  transmute(
+    seqn,
+    bmi_raw = bmxbmi,
+    bmi_clean = clean_outlier_var(bmxbmi, lo_bound = 10, hi_bound = 80),
+    bmi_flag = !is.na(bmi_raw) & is.na(bmi_clean)
+  )
+
+dat_bmi <- demo_adult %>%
+  left_join(bmi_clean_df, by = "seqn")
+```
+
+```{r}
+dat_bmi_long <- dat_bmi %>%
+  select(seqn, `Before Cleaning` = bmi_raw, `After Cleaning` = bmi_clean) %>%
+  pivot_longer(cols = -seqn, names_to = "stage", values_to = "bmi") %>%
+  mutate(stage = factor(stage, levels = c("Before Cleaning", "After Cleaning")))
+
+p_bmi_compare <- ggplot(dat_bmi_long, aes(x = stage, y = bmi, fill = stage)) +
+  geom_boxplot(width = 0.4, outlier.alpha = 0.25, na.rm = TRUE) +
+  labs(
+    title = "BMI Distribution Before vs. After Cleaning (Adults >= 20 years)",
+    x = NULL, y = expression(BMI~(kg/m^2))
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_bmi_compare)
+```
+
+```{r}
+sbp_cols <- names(bpx)[str_detect(names(bpx), "^bpxo?sy[1-3]$")]
+dbp_cols <- names(bpx)[str_detect(names(bpx), "^bpxo?di[1-3]$")]
+
+# 建立 bpx_clean：對每個 SBP 與 DBP 欄位進行清理
+bpx_clean <- bpx %>%
+  mutate(
+    # 保留原始平均 SBP
+    sbp_mean_raw = rowMeans(across(all_of(sbp_cols)), na.rm = TRUE),
+    dbp_mean_raw = rowMeans(across(all_of(dbp_cols)), na.rm = TRUE),
+    across(all_of(sbp_cols), ~ clean_outlier_var(.x, 70, 260), .names = "{.col}_clean"),
+    across(all_of(dbp_cols), ~ clean_outlier_var(.x, 40, 150), .names = "{.col}_clean")
+  ) %>%
+  mutate(
+    sbp_mean_raw = ifelse(is.nan(sbp_mean_raw), NA_real_, sbp_mean_raw),
+    dbp_mean_raw = ifelse(is.nan(dbp_mean_raw), NA_real_, dbp_mean_raw),
+    # 計算清理後的個人平均 SBP 與 DBP
+    sbp_mean_clean = rowMeans(across(all_of(paste0(sbp_cols, "_clean"))), na.rm = TRUE),
+    dbp_mean_clean = rowMeans(across(all_of(paste0(dbp_cols, "_clean"))), na.rm = TRUE),
+    sbp_mean_clean = ifelse(is.nan(sbp_mean_clean), NA_real_, sbp_mean_clean),
+    dbp_mean_clean = ifelse(is.nan(dbp_mean_clean), NA_real_, dbp_mean_clean)
+  )
+
+# 建立最終成年人分析資料集
+dat_week5 <- dat_bmi %>%
+  left_join(
+    bpx_clean %>% select(seqn, sbp_mean_raw, sbp_mean_clean, dbp_mean_raw, dbp_mean_clean),
+    by = "seqn"
+  )
+```
+
+```{r}
+dat_sbp_long <- dat_week5 %>%
+  select(seqn, `Before Cleaning` = sbp_mean_raw, `After Cleaning` = sbp_mean_clean) %>%
+  pivot_longer(cols = -seqn, names_to = "stage", values_to = "sbp") %>%
+  mutate(stage = factor(stage, levels = c("Before Cleaning", "After Cleaning")))
+
+p_sbp_compare <- ggplot(dat_sbp_long, aes(x = stage, y = sbp, fill = stage)) +
+  geom_boxplot(width = 0.4, outlier.alpha = 0.25, na.rm = TRUE) +
+  labs(
+    title = "Participant-Level Mean SBP Before vs. After Cleaning",
+    x = NULL, y = "Mean SBP (mmHg)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_sbp_compare)
+```
+
+```{r}
+miss_summary <- bind_rows(
+  tibble(variable = "BMI", stage = "Before", n_miss = sum(is.na(dat_week5$bmi_raw)), n_tot = nrow(dat_week5)),
+  tibble(variable = "BMI", stage = "After",  n_miss = sum(is.na(dat_week5$bmi_clean)), n_tot = nrow(dat_week5)),
+  tibble(variable = "Mean SBP", stage = "Before", n_miss = sum(is.na(dat_week5$sbp_mean_raw)), n_tot = nrow(dat_week5)),
+  tibble(variable = "Mean SBP", stage = "After",  n_miss = sum(is.na(dat_week5$sbp_mean_clean)), n_tot = nrow(dat_week5))
+) %>%
+  mutate(
+    p_miss = n_miss / n_tot,
+    stage = factor(stage, levels = c("Before", "After"))
+  )
+
+kable(miss_summary, digits = 3, caption = "Missingness Before and After Cleaning for BMI and Mean SBP")
+
+p_miss <- ggplot(miss_summary, aes(x = variable, y = p_miss, fill = stage)) +
+  geom_col(width = 0.6, position = "dodge") +
+  geom_text(
+    aes(label = paste0(percent(p_miss, accuracy = 0.1))),
+    position = position_dodge(width = 0.6), vjust = -0.2, size = 3.3
+  ) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.2))) +
+  labs(title = "Missing Rate Before vs. After Outlier Cleaning", x = NULL, y = "Missing Rate", fill = "Stage") +
+  theme_minimal(base_size = 12)
+
+print(p_miss)
+```
+
+```{r}
+p_scatter <- dat_week5 %>%
+  drop_na(bmi_clean, sbp_mean_clean, sex) %>%
+  ggplot(aes(x = bmi_clean, y = sbp_mean_clean, color = sex)) +
+  geom_point(alpha = 0.25, size = 1.2) +
+  geom_smooth(method = "lm", se = TRUE, color = "black", linetype = "dashed") +
+  facet_wrap(~ sex) +
+  labs(
+    title = "Association Between Cleaned BMI and Cleaned Mean SBP by Sex",
+    x = expression(Cleaned~BMI~(kg/m^2)),
+    y = "Cleaned Mean SBP (mmHg)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_scatter)
+```
+
+結論:BMI 與平均收縮壓中的離群值被轉為NA後，平均值沒有太大改變，但數據分佈更加集中。收縮壓與舒張壓的散佈圖看來收縮壓與BMI有正相關，而且斜率在性別中差異不大，但女性的血壓似乎比男性低一些
+
+# Week 6: Repeated-Measure
+
+```{r}
+bp_long <- bpx %>%
+  semi_join(demo_adult %>% select(seqn), by = "seqn") %>%
+  select(seqn, all_of(c(sbp_cols, dbp_cols))) %>%
+  pivot_longer(
+    cols = -seqn,
+    names_to = c("measure", "trial"),
+    names_pattern = "^bpxo?(sy|di)([1-3])$",
+    values_to = "value"
+  ) %>%
+  mutate(
+    measure = recode(measure, "sy" = "SBP", "di" = "DBP"),
+    trial = as.integer(trial),
+    trial_f = factor(trial, levels = 1:3, labels = c("Trial 1", "Trial 2", "Trial 3"))
+  )
+
+trial_summary <- bp_long %>%
+  group_by(measure, trial_f) %>%
+  summarise(
+    n = sum(!is.na(value)),
+    mean = mean(value, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    q1 = quantile(value, 0.25, na.rm = TRUE),
+    q3 = quantile(value, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(trial_summary, digits = 1, caption = "Raw BP Summary Across Repeated Trials (Trials 1-3)")
+```
+
+```{r}
+p_trial <- ggplot(bp_long, aes(x = trial_f, y = value, fill = trial_f)) +
+  geom_boxplot(outlier.alpha = 0.15, na.rm = TRUE) +
+  facet_wrap(~ measure, scales = "free_y") +
+  labs(title = "Raw BP Across Three Repeated Trials", x = NULL, y = "Blood pressure (mmHg)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_trial)
+
+```
+
+Do the three BP trials look similar at the population level?
+
+是，三次的舒張壓和收縮壓平均值、中位數都相近，盒鬚圖上也可以看到不受次序先後影響
+
+```{r}
+sbp_change <- bp_long %>%
+  filter(measure == "SBP") %>%
+  select(seqn, trial, value) %>%
+  mutate(trial = paste0("trial", trial)) %>%
+  pivot_wider(names_from = trial, values_from = value) %>%
+  mutate(
+    delta_31 = trial3 - trial1,
+    change_direction = case_when(
+      is.na(delta_31) ~ NA_character_,
+      delta_31 < 0 ~ "Trial 3 lower",
+      delta_31 > 0 ~ "Trial 3 higher",
+      TRUE ~ "No change"
+    )
+  )
+
+kable(sbp_change %>% count(change_direction), caption = "Direction of Within-Person SBP Change (Trial 3 vs. Trial 1)")
+
+sbp_change_sum <- sbp_change %>%
+  summarise(
+    n_complete = sum(!is.na(delta_31)),
+    mean_change = mean(delta_31, na.rm = TRUE),
+    median_change = median(delta_31, na.rm = TRUE),
+    q1 = quantile(delta_31, 0.25, na.rm = TRUE),
+    q3 = quantile(delta_31, 0.75, na.rm = TRUE)
+  )
+kable(sbp_change_sum, digits = 2, caption = "Summary of Within-Person SBP Change (Trial 3 - Trial 1)")
+
+# Histogram of Trial 3 - Trial 1
+p_change <- sbp_change %>%
+  drop_na(delta_31) %>%
+  ggplot(aes(x = delta_31)) +
+  geom_histogram(binwidth = 2, boundary = 0, color = "white", fill = "steelblue") +
+  geom_vline(xintercept = 0, linetype = 2, color = "red") +
+  labs(title = "Within-Person Change in SBP: Trial 3 - Trial 1",
+       x = "SBP change (mmHg)", y = "Number of participants") +
+  theme_minimal(base_size = 12)
+print(p_change)
+
+# Spaghetti plot for 60 participants
+complete_ids <- sbp_change %>%
+  drop_na(trial1, trial2, trial3) %>%
+  arrange(seqn) %>%
+  slice_head(n = 60) %>%
+  pull(seqn)
+
+p_lines <- bp_long %>%
+  filter(measure == "SBP", seqn %in% complete_ids) %>%
+  ggplot(aes(x = trial, y = value, group = factor(seqn))) +
+  geom_line(alpha = 0.35) +
+  geom_point(alpha = 0.5, size = 1.2) +
+  scale_x_continuous(breaks = 1:3, labels = c("Trial 1", "Trial 2", "Trial 3")) +
+  labs(title = "Within-Person SBP Changes Across Repeated Trials (n = 60)",
+       x = "Trial", y = "SBP (mmHg)") +
+  theme_minimal(base_size = 12)
+print(p_lines)
+```
+
+多數受試者在第 1 次與第 3 次測量間發生血壓改變
+
+```{r}
+bp_within_raw <- bp_long %>%
+  group_by(seqn, measure) %>%
+  summarise(
+    n_readings = sum(!is.na(value)),
+    mean_bp = ifelse(n_readings > 0, mean(value, na.rm = TRUE), NA_real_),
+    range_bp = ifelse(n_readings >= 2, max(value, na.rm = TRUE) - min(value, na.rm = TRUE), NA_real_),
+    sd_bp = ifelse(n_readings >= 2, sd(value, na.rm = TRUE), NA_real_),
+    .groups = "drop"
+  )
+
+within_summary_raw <- bp_within_raw %>%
+  filter(n_readings >= 2) %>%
+  group_by(measure) %>%
+  summarise(
+    median_range = median(range_bp, na.rm = TRUE),
+    p90_range = quantile(range_bp, 0.90, na.rm = TRUE),
+    median_sd = median(sd_bp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(within_summary_raw, digits = 1, caption = "Raw Within-Person BP Variability Summary")
+```
+
+SBP 的個人內標準差中位數為 $3.2\text{ mmHg}$，而 DBP 為 $2.0\text{ mmHg}$。收縮壓變異大，可能有其他因素影響
+
+# Part B: Homework
+
+```{r}
+sbp_clean_cols <- paste0(sbp_cols, "_clean")
+dbp_clean_cols <- paste0(dbp_cols, "_clean")
+
+bp_clean_long <- bpx_clean %>%
+  semi_join(demo_adult %>% select(seqn), by = "seqn") %>%
+  select(seqn, all_of(c(sbp_clean_cols, dbp_clean_cols))) %>%
+  pivot_longer(
+    cols = -seqn,
+    names_to = c("measure", "trial"),
+    names_pattern = "^bpxo?(sy|di)([1-3])_clean$",
+    values_to = "value"
+  ) %>%
+  mutate(
+    measure = recode(measure, "sy" = "SBP", "di" = "DBP"),
+    trial = as.integer(trial)
+  )
+
+# 彙整每位受試者的 Trial 1、平均值、中位數與個人內變異指標
+bp_person_summary <- bp_clean_long %>%
+  group_by(seqn, measure) %>%
+  summarise(
+    n_readings = sum(!is.na(value)),
+    trial1 = value[trial == 1],
+    mean_bp = ifelse(n_readings > 0, mean(value, na.rm = TRUE), NA_real_),
+    median_bp = ifelse(n_readings > 0, median(value, na.rm = TRUE), NA_real_),
+    range_bp = ifelse(n_readings >= 2, max(value, na.rm = TRUE) - min(value, na.rm = TRUE), NA_real_),
+    sd_bp = ifelse(n_readings >= 2, sd(value, na.rm = TRUE), NA_real_),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = measure,
+    values_from = c(n_readings, trial1, mean_bp, median_bp, range_bp, sd_bp),
+    names_glue = "{measure}_{.value}"
+  )
+```
+
+```{r}
+classify_bp <- function(sbp, dbp) {
+  case_when(
+    is.na(sbp) | is.na(dbp) ~ NA_character_,
+    sbp >= 140 | dbp >= 90  ~ "Stage 2",
+    sbp >= 130 | dbp >= 80  ~ "Stage 1",
+    sbp >= 120 & dbp < 80   ~ "Elevated",
+    sbp < 120  & dbp < 80   ~ "Normal"
+  ) %>%
+    factor(levels = c("Normal", "Elevated", "Stage 1", "Stage 2"))
+}
+
+bp_classified <- bp_person_summary %>%
+  mutate(
+    cat_trial1 = classify_bp(SBP_trial1, DBP_trial1),
+    cat_mean   = classify_bp(SBP_mean_bp, DBP_mean_bp),
+    cat_median = classify_bp(SBP_median_bp, DBP_median_bp)
+  ) %>%
+  drop_na(cat_trial1, cat_mean) %>%
+  mutate(
+    reclassified = (cat_trial1 != cat_mean)
+  )
+```
+
+```{r}
+reclass_prop <- mean(bp_classified$reclassified)
+cat("Overall Reclassification Proportion (Trial 1 vs. Mean BP):", percent(reclass_prop, accuracy = 0.1), "\n")
+
+cross_tab <- bp_classified %>%
+  count(cat_trial1, cat_mean) %>%
+  pivot_wider(names_from = cat_mean, values_from = n, values_fill = 0)
+
+kable(cross_tab, caption = "Cross-Tabulation: Trial 1 BP Category (Rows) vs. Mean BP Category (Columns)")
+```
+
+16.9%受試者在改標準改採為三次平均後，分類組別改變
+
+```{r}
+heatmap_df <- bp_classified %>%
+  count(cat_trial1, cat_mean) %>%
+  group_by(cat_trial1) %>%
+  mutate(prop_row = n / sum(n)) %>%
+  ungroup()
+
+p_heatmap <- ggplot(heatmap_df, aes(x = cat_mean, y = cat_trial1, fill = n)) +
+  geom_tile(color = "white", linewidth = 0.8) +
+  geom_text(aes(label = paste0(n, "\n(", percent(prop_row, accuracy = 0.1), ")")), size = 3.8) +
+  scale_fill_gradient(low = "#e0f3db", high = "#43a2ca") +
+  labs(
+    title = "BP Classification Agreement: Trial 1 vs. Repeated-Measure Mean",
+    subtitle = "Diagonal cells indicate unchanged category; off-diagonal cells indicate reclassification",
+    x = "Category Based on Mean BP",
+    y = "Category Based on Trial 1 Only",
+    fill = "Count"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p_heatmap)
+```
+
+右下角是被改成較高的組別，左上角是被改成較低的組別，在被重新分組的組別中，改低人數大於改高人數。
+
+```{r}
+var_reclass <- bp_classified %>%
+  filter(SBP_n_readings >= 2, !is.na(SBP_sd_bp)) %>%
+  mutate(
+    sbp_var_group = ntile(SBP_sd_bp, 3),
+    sbp_var_group = factor(
+      sbp_var_group,
+      levels = 1:3,
+      labels = c("Low Variability (T1)", "Medium Variability (T2)", "High Variability (T3)")
+    )
+  ) %>%
+  group_by(sbp_var_group) %>%
+  summarise(
+    n_participants = n(),
+    median_sbp_sd = median(SBP_sd_bp, na.rm = TRUE),
+    n_reclassified = sum(reclassified),
+    reclass_rate = mean(reclassified),
+    .groups = "drop"
+  )
+
+kable(var_reclass, digits = 3, caption = "Reclassification Rate Across Within-Person SBP Variability Groups")
+
+p_var_reclass <- ggplot(var_reclass, aes(x = sbp_var_group, y = reclass_rate, fill = sbp_var_group)) +
+  geom_col(width = 0.55) +
+  geom_text(aes(label = percent(reclass_rate, accuracy = 0.1)), vjust = -0.4, size = 4) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Proportion Reclassified by Within-Person SBP Variability Group",
+    x = "Within-Person SBP Variability Group (SD Tertiles)",
+    y = "Reclassification Proportion"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+print(p_var_reclass)
+
+```
+
+變異數越高組別，被重新分組的比率越高
+
+```{r}
+comp_pairs <- tibble(
+  Comparison = c("Trial 1 vs. Mean", "Trial 1 vs. Median", "Mean vs. Median"),
+  Prop_Changed = c(
+    mean(bp_classified$cat_trial1 != bp_classified$cat_mean, na.rm = TRUE),
+    mean(bp_classified$cat_trial1 != bp_classified$cat_median, na.rm = TRUE),
+    mean(bp_classified$cat_mean   != bp_classified$cat_median, na.rm = TRUE)
+  )
+)
+kable(comp_pairs, digits = 4, caption = "Optional Challenge: Proportion of Category Changes Across Strategies")
+```
+
+只使用第一次測量結果作為分類標準，分類被改變的機率高
+
+結論:在群體分布上，三次重複測量的收縮壓平均值與中位數幾乎完全不變，表示分布穩定。 但在個體內變異上；多數受試者在第 1 次與第 3 次測量間發生血壓改變，個人標準差中位數為 $3.2\text{ mmHg}$。 當改以三次測量的平均值（Mean BP）取代單次測量（Trial 1）進行分級時，有 16.91% 的受試者被重新分類，其中降級人數多於升級，代表單次測量會容易高估高血壓的臨床分級，被重新分類率與個人收縮壓變異度呈現正相關。
